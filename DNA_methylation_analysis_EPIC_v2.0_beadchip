@@ -1,0 +1,376 @@
+---
+title: "DNA_methylation_EPICv2.0_analysis"
+author: "Arun Paulose"
+format: html
+---
+
+## Loading libraries for the DNA Methylation EPIC v2.0 beadchip data
+
+```{r}
+library("limma")
+library("minfi")
+library("RColorBrewer")
+library("missMethyl")
+library("minfiData")
+library("Gviz")
+library("DMRcate")
+library("DMRcatedata")
+library("stringr")
+library("mCSEA")
+library("tidyverse")
+library("IlluminaHumanMethylationEPICv2anno.20a1.hg38")
+library("GEOquery")
+library("bsseq")
+library("edgeR")
+library("ChAMP")
+library("ggfortify")
+library("RColorBrewer")
+library("Rtsne")
+library("uwot")
+library("dplyr")
+library("wateRmelon")
+library("doParallel")
+library("ENmix")
+library("pheatmap")
+```
+
+## loading the data for the analysis
+
+## We need to load the idat files and Sample sheets also
+
+```{r}
+data_directory <- "/home/gaurab/Arun_Projects/Minfi_champ_pipeline/data/"
+annoEPICv2 <- getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+targets <- read.metharray.sheet(data_directory, pattern = "sample_sheet_new.csv")
+```
+
+## Categorizing the data for better modelling
+
+## Not needed if your continuous sample sheet data is correlating with the methylation data
+
+```{r}
+targets$AgeGroup <- cut(targets$Age,
+                        breaks = c(-Inf, 30, 50, Inf),
+                        labels = c(1, 2, 3))
+targets$BMICategory <- cut(targets$BMI,
+                           breaks = c(-Inf, 18.5, 24.9, 29.9, Inf),
+                           labels = c(1, 2, 3, 4))
+q <- quantile(targets$T.S.ratio, probs = c(1/3, 2/3), na.rm = TRUE)
+targets$tel_classes <- cut(
+  targets$T.S.ratio,
+  breaks = c(-Inf, q[1], q[2], Inf),
+  labels = c(1, 2, 3),
+  right = TRUE
+)
+
+SpO2_classes <- function(x) {
+  if (x >= 95) {
+    return(1)
+  }else if(x >= 90 && x <= 94){
+    return(2)
+  } else if (x >= 85 && x <= 89){
+    return(3)
+  } else {
+    return(4)
+  }
+}
+SpO2_levels <- sapply(targets$SpO2, SpO2_classes)
+```
+
+## Converting the idat files into red green intensity data
+
+```{r}
+rgSet <- read.metharray.exp(targets = targets)
+pData(rgSet)
+getManifest(rgSet)
+targets$ID  <- paste(targets$Sample_Group, targets$Sample_Name, sep = ".")
+sampleNames(rgSet) <- targets$ID
+pData(rgSet)
+```
+
+## Creating minfi classes
+
+```{r}
+MSet <- preprocessRaw(rgSet)
+ratioSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+gset <- mapToGenome(ratioSet)
+```
+
+## Normalization
+
+## We need to remove
+
+## If we expect large methylation difference between the methylation data we use
+
+## preprocessFUNNORM
+
+## If we do not expect such difference we use
+
+## preprocessNOOB and preprocessQuantile
+
+```{r}
+mSetSq <- preprocessNoob(rgSet)
+mSetSq <- preprocessQuantile(mSetSq)
+```
+
+## Filtering and QC purpose
+
+## removing the probes which have detection p value less than 0.00001
+
+## removing the probes associated with snps
+
+```{r}
+detP <- detectionP(rgSet)
+detP <- detP[match(featureNames(mSetSq),rownames(detP)),]
+keep <- rowSums(detP < 0.00001) == ncol(detP)
+table(keep)
+length(keep)
+nrow(mSetSq)
+keep_subset <- keep[rownames(mSetSq)]
+mSetSqFlt <- mSetSq[keep_subset, ]
+mSetSqFlt
+mSetSqFlt <- dropLociWithSnps(mSetSqFlt)
+mSetSqFlt
+mVals <- getM(mSetSqFlt)
+beta <- getBeta(mSetSqFlt)
+```
+
+## BMIQ normalization, can only done with the beta values
+
+## whatever we generated in the mVals, we will generate again
+
+## The BMIQ will take some time for completing
+
+## we made a function which convert the beta value into m value
+
+```{r}
+design.v <- annoEPICv2[match(rownames(beta), annoEPICv2$Name), "Type"]
+design.v <- ifelse(design.v == "I", 1, 2)
+beta.bmiq <- beta  
+
+for (i in seq_len(ncol(beta))) {
+  cat("Running BMIQ for sample", colnames(beta)[i], "\n")
+  res <- tryCatch({
+    out <- BMIQ(beta[, i], design.v = design.v, sampleID = colnames(beta)[i])
+    beta.bmiq[, i] <- out$nbeta
+  }, error = function(e) {
+    message("BMIQ failed on sample ", colnames(beta)[i], ": ", e$message)
+  })
+}
+beta_to_m <- function(beta, epsilon = 1e-6) {
+  beta <- pmin(pmax(beta, epsilon), 1 - epsilon)
+  log2(beta/(1 - beta))
+}
+Mvals <- beta_to_m(beta.bmiq)
+```
+
+## Batch correction
+
+```{r}
+myCombat <- champ.runCombat(beta = Mvals, pd = targets,batchname = c("Slide"), logitTrans = FALSE)
+myCombat |> View()
+Mvals_upgraded <- as.data.frame(myCombat)
+```
+
+##MDS plot
+
+```{r}
+
+pal = brewer.pal(8, "Dark2")
+plotMDS(test_df, top= 899042 , gene.selection="common",
+        col=pal[factor(test_targets$Sample_Group)], dim=c(1,2), pch = 16)
+legend("topleft", legend=levels(factor(test_targets$Sample_Group)), text.col=pal,
+       bg="white", cex=0.5)
+```
+
+```{r}
+pal = brewer.pal(8, "Dark2")
+plotMDS(test_df, top= 899042 , gene.selection="common",
+        col=pal[factor(test_targets$Slide)], dim=c(1,2), pch = 16)
+legend("topleft", legend=levels(factor(test_targets$Slide)), text.col=pal,
+       bg="white", cex=0.5)
+
+```
+
+## Singular value decomposition analysis
+
+## From the singular value decomposition from the ChAMP pipeline
+
+## I have curated some code for better figure generation using the ggplot2
+
+## The svd figures will be saved in your working directory, check the svd to find the covariates
+
+```{r}
+install.packages("scico")
+library(scico)
+
+champ.SVD.gg <- function(beta, pd, top_n = 20, resultsDir = "./CHAMP_SVDimages_gg/") {
+  library(ggplot2)
+  library(reshape2)
+  library(gridExtra)
+
+  if (!dir.exists(resultsDir)) dir.create(resultsDir)
+
+  if (any(is.na(beta))) {
+    warning("There are NA values in your beta matrix. Consider imputing them before analysis.")
+  }
+
+  if (is.data.frame(beta)) beta <- as.matrix(beta)
+
+  tmp.m <- beta - rowMeans(beta)
+  svd.o <- svd(tmp.m)
+
+  pve <- svd.o$d^2 / sum(svd.o$d^2) * 100
+  top_n <- min(top_n, length(pve))
+
+  PhenoTypes <- pd[, sapply(pd, function(x) length(unique(x)) > 1), drop = FALSE]
+  svdPV <- matrix(nrow = top_n, ncol = ncol(PhenoTypes))
+  colnames(svdPV) <- colnames(PhenoTypes)
+  rownames(svdPV) <- paste0("PC-", 1:top_n)
+
+  for (i in 1:top_n) {
+    for (j in 1:ncol(PhenoTypes)) {
+      y <- svd.o$v[, i]
+      x <- PhenoTypes[[j]]
+      if (is.numeric(x)) {
+        svdPV[i, j] <- summary(lm(y ~ x))$coefficients[2, 4]
+      } else {
+        svdPV[i, j] <- kruskal.test(y ~ as.factor(x))$p.value
+      }
+    }
+  }
+
+
+  df_pvalues <- melt(svdPV)
+  colnames(df_pvalues) <- c("PC", "Factor", "p_value")
+  df_pvalues$PC <- factor(df_pvalues$PC, levels = paste0("PC-", 1:top_n))
+  df_pvalues$Factor <- factor(df_pvalues$Factor, levels = colnames(PhenoTypes))
+
+
+  df_heat <- df_pvalues
+  df_heat$log10p <- -log10(df_heat$p_value)
+
+  p1 <- ggplot(df_heat, aes(x = Factor, y = PC, fill = log10p)) +
+    geom_tile() +
+    scale_fill_scico(palette = "batlow", direction = -1, name = "-log10(p-value)") +
+    labs(title = "Singular Value Decomposition Analysis (SVD)", x = "Factors", y = "Principal Components") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  ggsave(file.path(resultsDir, "SVD_heatmap_ggplot.png"), p1, width = 10, height = 6)
+
+
+  df_scree <- data.frame(PC = paste0("PC-", 1:length(pve)), Variance = pve)
+  df_scree$PC <- factor(df_scree$PC, levels = paste0("PC-", 1:length(pve)))
+
+  p2 <- ggplot(df_scree[1:top_n, ], aes(x = PC, y = Variance)) +
+    geom_bar(stat = "identity", fill = "#377eb8") +
+    labs(title = "Scree Plot", x = "Principal Component", y = "% Variance Explained") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  ggsave(file.path(resultsDir, "SVD_scree_barplot_ggplot.png"), p2, width = 8, height = 5)
+
+
+  pdf(file.path(resultsDir, "SVD_summary.pdf"), width = 10, height = 10)
+  grid.arrange(p1, p2, ncol = 1)
+  dev.off()
+
+  message("[champ.SVD.gg complete. You can now proceed to correction (if needed) or downstream analyses.]")
+
+  return(list(
+    pvalue_matrix = svdPV,        
+    pvalue_long_df = df_pvalues    
+  ))
+}
+svd_results <- champ.SVD.gg(beta = Mvals_upgraded, pd = targets)
+```
+
+##Blood cell type heterogenity correction \## For EPIC v2.0 the blood cell type heterogenity is not well studied better avoid this chunk
+
+```{r}
+renv::install("Bioc::FlowSorted.BloodExtended.EPIC")
+library("FlowSorted.BloodExtended.EPIC")
+data("FlowSorted.BloodExtended.EPIC")
+#library("FlowSorted.Blood.EPIC")
+FlowSorted.Blood.EPIC <- libraryDataGet("FlowSorted.Blood.EPIC")
+cellCounts <- estimateCellCounts(rgSet, 
+                                 compositeCellType = "Blood",
+                                 processMethod = "preprocessNoob", 
+                                 probeSelect = "IDOL",
+                                 cellTypes = c("CD8T", "CD4T", "NK", "Bcell", "Mono", "Neu"),
+                                 referencePlatform = "IlluminaHumanMethylationEPIC",
+                                 referencePkg = "FlowSorted.Blood.EPIC")
+```
+
+## Modelling the data using the covariates found from the svd
+
+## Here I have given the contrasts matrix for modelling the individual group comparisons
+
+```{r}
+cell_groups <- targets$Sample_Group
+Age <- targets$AgeGroup
+batch <- factor(targets$Slide)
+Tel_len <- factor(targets$tel_classes)
+SpO2 <- factor(targets$SpO2_l)
+PC1 <- targets$PC1
+PC2 <- targets$PC2
+design_4 <- model.matrix(~0 + cell_groups + PC1 + tel_len + SpO2 + Age + batch, data = targets)
+design_3
+colnames(design_4) <- make.names(colnames(design_4))
+fit <- lmFit(Mvals_upgraded, design_4)
+contMatrix <- makeContrasts(cell_groupsHighlander-cell_groupsControl,
+                            cell_groupsmild-cell_groupsControl,
+                            cell_groupsmod-cell_groupsControl,
+                            cell_groupsSev-cell_groupsControl,
+                            cell_groupsmod-cell_groupsmild,
+                            cell_groupsSev-cell_groupsmild,
+                            cell_groupsSev-cell_groupsmod,
+                            cell_groupsmild-cell_groupsHighlander,
+                            cell_groupsmod-cell_groupsHighlander,
+                            cell_groupsSev-cell_groupsHighlander,
+                            levels = design_4)
+
+contMatrix |> View()
+fit2 <- contrasts.fit(fit, contMatrix)
+fit2 <- eBayes(fit2)
+summary(fit)
+```
+
+## Differential methylation probes identification from the analysis
+
+## Here I am only showing 1 contrasts results(highlander vs control)
+
+```{r}
+DMPs_cont_vs_HL <- topTable(fit2, coef = "cell_groupsHighlander - cell_groupsControl", number = Inf, adjust = "BH", genelist = annoEPICv2Sub)
+Sig_CpGs <- DMPs_cont_vs_HL %>%
+  filter(adj.P.Val < 0.05)
+```
+
+## Differential methylation regions identification using the DMRcate algorithm
+
+```{r}
+mVals <- as.matrix(Mvals_upgraded)
+myAnnotation <- cpg.annotate(object = mVals,
+                             datatype = "array",
+                             what = "M",
+                             analysis.type = "differential",
+                             design = design_4,
+                             contrasts = TRUE,
+                             cont.matrix = contMatrix,
+                             coef = "cell_groupsHighlander - cell_groupsControl",
+                             arraytype = "EPICv2")
+DMRs_cont_vs_hl <- dmrcate(myAnnotation, lambda = 1000, C = 2)
+DMRs_cont_vs_hl
+results.ranges<- extractRanges(DMRs_cont_vs_hl)
+```
+
+## Gene Ontology and KEGG pathway analysis
+
+```{r}
+go_genes <- gometh(sig.cpg=sigCpGs, all.cpg=all, collection = "GO", sig.genes = TRUE)
+topGSA(go_genes, number=10)
+KEGG_genes <- gometh(sig.cpg=sigCpGs, all.cpg=all, collection = "KEGG", sig.genes = TRUE)
+topGSA(KEGG_genes, number=10)
+```
+
